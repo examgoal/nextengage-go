@@ -1,0 +1,63 @@
+name: Release
+
+# Cut a GitHub Release whenever a version tag (e.g. v1.2.3) is pushed.
+#
+# For a Go module the tag itself IS the published artifact — proxy.golang.org
+# serves `go get module@vX.Y.Z` straight from the tag, no upload step. So this
+# workflow doesn't "publish"; it (1) re-runs the test gate against the tagged
+# commit, (2) drafts a GitHub Release with auto-generated notes, and (3) warms
+# the module proxy + pkg.go.dev so the version is fetchable/indexed promptly.
+#
+# Release flow: land changes on main, then
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+# Tags are immutable on the proxy — never re-point an existing version.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the GitHub Release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so release notes diff against the prior tag
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Test gate
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+          go vet ./...
+          go build ./...
+          go test ./...
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+      - name: Warm proxy + pkg.go.dev
+        run: |
+          MODULE=github.com/examgoal/nextengage-go
+          VERSION="$GITHUB_REF_NAME"
+          # Hitting the proxy .info endpoint makes proxy.golang.org fetch & cache
+          # the version from GitHub; the pkg.go.dev request kicks off doc indexing.
+          curl -fsS "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info" || true
+          curl -fsS -o /dev/null "https://pkg.go.dev/${MODULE}@${VERSION}" || true
+
+      - name: Summary
+        run: echo "### Released ${GITHUB_REF_NAME} 🎉 — \`go get github.com/examgoal/nextengage-go@${GITHUB_REF_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
